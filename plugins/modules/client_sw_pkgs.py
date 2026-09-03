@@ -47,6 +47,14 @@ options:
         description:
             - Architecture (x86, amd64, etc.)
         required: true
+    ver:
+        description:
+            - OS distribution major version (for example '10' or '11'). Used on
+              Solaris to select SVR4 (Solaris 10) versus native IPS (Solaris 11)
+              package media.
+        type: str
+        required: false
+        default: ''
     path:
         description:
             - Client software directory
@@ -124,6 +132,12 @@ import os
 import traceback
 import glob
 import re
+import tarfile
+
+try:
+    from urllib.parse import unquote
+except ImportError:  # Python 2
+    from urllib import unquote
 
 
 # ------------------------------------------------------------------------------
@@ -210,6 +224,11 @@ def run_module():
                 'type': 'str',
                 'required': True
             },
+            'ver': {
+                'type': 'str',
+                'required': False,
+                'default': ''
+            },
             'path': {
                 'type': 'str',
                 'required': True
@@ -271,6 +290,7 @@ def run_normal(params, result):
     sys = params['sys'].lower()
     dist = params['dist'].lower()
     arch = params['arch'].lower()
+    ver = params.get('ver', '') or ''
     facts = params['facts']
     facts_key = params['facts_key'] if params['facts_key'] else FACTS_KEY_DEFAULT
 
@@ -281,7 +301,7 @@ def run_normal(params, result):
 
         # Find packages
         if err is None:
-            err, packages = find_packages(path, sys, dist, arch)
+            err, packages = find_packages(path, sys, dist, arch, ver)
 
     except Exception:
         tb = traceback.format_exc()
@@ -329,7 +349,7 @@ def check_dir(path):
 
 
 # ------------------------------------------------------------------------------
-def find_packages(sw_path, sys, dist, arch):
+def find_packages(sw_path, sys, dist, arch, ver=''):
     """
     Find packages
     """
@@ -337,6 +357,13 @@ def find_packages(sw_path, sys, dist, arch):
     # Return values
     err = None
     packages = {}
+
+    # Solaris 11 and later ship Authentication Services as a native IPS package
+    # archive (sas-*.p5p) rather than SVR4 datastream packages (*.pkg). Discover
+    # the archive and report the component packages it provides so the install
+    # path can use 'pkg install -g <archive>'.
+    if sys == 'sunos' and _solaris_major(ver) >= 11:
+        return find_packages_solaris_ips(sw_path, arch)
 
     # Find package path for specified sys and arch
     err, pkgs_dir = find_packages_path(sys, arch)
@@ -364,6 +391,108 @@ def find_packages(sw_path, sys, dist, arch):
         err = 'No packages found at ' + sw_path + ' for sys=' + sys + ', dist=' + dist + ', arch=' + arch
 
     # Return
+    return err, packages
+
+
+# ------------------------------------------------------------------------------
+def _solaris_major(ver):
+    """
+    Parse a Solaris major version ('10', '11', '11.4', ...) into an int, 0 if
+    unknown.
+    """
+    try:
+        return int(str(ver).split('.')[0])
+    except (ValueError, TypeError, AttributeError):
+        return 0
+
+
+# ------------------------------------------------------------------------------
+def _version_key(vers):
+    """
+    Turn a dotted version string into a comparable tuple for sorting.
+    """
+    parts = []
+    for part in str(vers).split('.'):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+# ------------------------------------------------------------------------------
+def _p5p_packages(archive_path):
+    """
+    Read the packages (and their real versions) contained in a Solaris IPS
+    package archive (.p5p). A .p5p is a USTAR tar whose package manifests live
+    at 'publisher/<publisher>/pkg/<name>/<encoded-fmri-version>'. The encoded
+    version is URL-quoted and carries the build branch after a comma, for
+    example '1.4.0.70%2C5.11-0%3A...' -> release '1.4.0.70'. This avoids
+    assuming package membership or version from the archive file name.
+    """
+
+    packages = {}
+    tar = None
+    try:
+        tar = tarfile.open(archive_path)
+        for name in tar.getnames():
+            parts = name.split('/')
+            # publisher/<pub>/pkg/<name>/<encoded-version>
+            if (len(parts) == 5 and parts[0] == 'publisher'
+                    and parts[2] == 'pkg' and parts[4]):
+                pkg_name = parts[3]
+                vers = unquote(parts[4]).split(',')[0]
+                if (pkg_name not in packages
+                        or _version_key(vers) > _version_key(packages[pkg_name])):
+                    packages[pkg_name] = vers
+    except (tarfile.TarError, OSError, IOError):
+        packages = {}
+    finally:
+        if tar is not None:
+            tar.close()
+
+    return packages
+
+
+# ------------------------------------------------------------------------------
+def find_packages_solaris_ips(sw_path, arch):
+    """
+    Discover Authentication Services IPS package archives (*.p5p) for Solaris 11
+    and report the component packages they actually contain, with each package's
+    real version, by reading the archive contents. When a package appears in
+    more than one archive (or version) the highest version is selected so both
+    discovery and install use the same, deterministic archive.
+    """
+
+    err = None
+    packages = {}
+
+    if arch in ('sparc', 'sparc64', 'sun4v', 'sun4u'):
+        pkgs_dir = 'solaris11-sparc'
+    else:
+        pkgs_dir = 'solaris11-x64'
+
+    base = os.path.join(sw_path, pkgs_dir)
+
+    for archive in sorted(glob.glob(os.path.join(base, '*.p5p'))):
+        fname = os.path.basename(archive)
+        for pkg_name, vers in _p5p_packages(archive).items():
+            existing = packages.get(pkg_name)
+            if existing is None \
+                    or _version_key(vers) > _version_key(existing['vers']):
+                packages[pkg_name] = {
+                        'path': archive,
+                        'file': fname,
+                        'vers': vers
+                    }
+
+    # Find preflight
+    packages['preflight'] = find_preflight(base)
+
+    if not any(key != 'preflight' for key in packages):
+        err = 'No Authentication Services IPS package archive (*.p5p) found ' \
+            'under ' + base
+
     return err, packages
 
 

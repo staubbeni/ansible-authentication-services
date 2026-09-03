@@ -1,14 +1,51 @@
 ---
 
 # ------------------------------------------------------------------------------
-# Solaris - grab package version 
+# Solaris - grab package version
+#
+# A host may have the package registered in either database:
+#   * IPS   ('pkg info')   - Solaris 11 native, installed by this role
+#   * SVR4  ('pkginfo')    - Solaris 10, or a Solaris 11 host installed by an
+#                            older version of this collection (legacy .pkg)
+#
+# Probe both, prefer IPS when present, and expose which packaging system holds
+# the package so the install/upgrade path can migrate a legacy SVR4 install to
+# IPS on Solaris 11. A clean version string is handed to set_version.yml via
+# pkg_version.stdout so the shared parser cannot latch onto an FMRI fragment
+# (e.g. the '5.11' build-branch component).
 # ------------------------------------------------------------------------------
 
-# Grab installed version of package 
-- name: get {{ package }} version
+- name: "get {{ package }} IPS version"
   command:
-    cmd: pkginfo -l {{ package }}
-  register: pkg_version
+    cmd: "pkg info {{ package }}"
+  register: sas_ips_info
   changed_when: false
   failed_when: false
-  ignore_errors: true
+  when: ansible_facts['distribution_major_version'] is version('11', '>=')
+
+- name: "get {{ package }} SVR4 version"
+  command:
+    cmd: "pkginfo -l {{ package }}"
+  register: sas_svr4_info
+  changed_when: false
+  failed_when: false
+
+- name: "determine {{ package }} version and packaging system"
+  set_fact:
+    sas_ips_ver: >-
+      {{ (sas_ips_info.stdout | default('', true)
+          | regex_findall('Version:\s*([0-9][0-9.]*)')
+          | first | default('', true))
+         if (sas_ips_info.rc | default(1)) == 0 else '' }}
+    sas_svr4_ver: >-
+      {{ (sas_svr4_info.stdout | default('', true)
+          | regex_findall('VERSION:\s*([0-9][0-9.]*)')
+          | first | default('', true))
+         if (sas_svr4_info.rc | default(1)) == 0 else '' }}
+
+- name: "record {{ package }} version and packaging system"
+  set_fact:
+    pkg_version:
+      stdout: "{{ sas_ips_ver if sas_ips_ver else sas_svr4_ver }}"
+    "sas_client_sw_{{ package }}_pkgsys": >-
+      {{ 'ips' if sas_ips_ver else ('svr4' if sas_svr4_ver else '') }}

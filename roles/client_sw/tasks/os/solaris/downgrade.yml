@@ -2,6 +2,10 @@
 
 # ------------------------------------------------------------------------------
 # Solaris - downgrade package
+#
+# Neither SVR4 nor 'pkg install -g' downgrades a package in place, so remove the
+# installed package then install the target version. On Solaris 11 remove.yml
+# uses 'pkg uninstall' and install.yml uses 'pkg install -g'.
 # ------------------------------------------------------------------------------
 
 - include_tasks: "remove.yml"

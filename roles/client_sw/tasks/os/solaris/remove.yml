@@ -2,12 +2,79 @@
 
 # ------------------------------------------------------------------------------
 # Solaris - remove package
+#
+# Remove with the tool that matches how the package is registered, not just the
+# OS version: a Solaris 11 host installed by an older release of this collection
+# is registered in the SVR4 database and must be removed with pkgrm, otherwise
+# 'pkg uninstall' is a no-op and the package is left behind.
+#
+#   * IPS  ('pkg uninstall')          - package registered in IPS
+#   * SVR4 (interactive 'pkgrm')       - package registered in SVR4 (Solaris 10,
+#                                        or a legacy install on Solaris 11)
+#
+# The interactive pkgrm (no '-n') runs the SVR4 preremove request script so the
+# SMF service is unregistered.
 # ------------------------------------------------------------------------------
 
-# Remove package
-- name: remove {{ package }}
-  svr4pkg:
-    name: "{{ package }}"
-    state: absent 
-  register: pkg_remove 
-  changed_when: true 
+- name: set Authentication Services Solaris packaging facts
+  set_fact:
+    sas_solaris_is_ips: >-
+      {{ ansible_facts['distribution_major_version']
+         is version('11', '>=') }}
+    sas_pkgsys: >-
+      {{ hostvars[inventory_hostname]['sas_client_sw_' ~ package ~ '_pkgsys']
+         | default('') }}
+
+- name: set Solaris removal method
+  set_fact:
+    sas_remove_svr4: >-
+      {{ (not (sas_solaris_is_ips | bool)) or sas_pkgsys == 'svr4' }}
+
+# Package registered in IPS
+- name: "remove {{ package }} (IPS)"
+  command:
+    cmd: "pkg uninstall '{{ package }}'"
+  register: pkg_remove
+  changed_when: pkg_remove.rc == 0
+  # pkg rc 4 == "nothing to do" (package not installed)
+  failed_when:
+    - pkg_remove.rc != 0
+    - pkg_remove.rc != 4
+  when: not (sas_remove_svr4 | bool)
+
+# Package registered in SVR4 (Solaris 10, or a legacy Solaris 11 install).
+# temp_dir_create.yml only runs when a package is being installed, so an
+# absent-only playbook must ensure the admin-file directory exists here.
+- name: ensure SVR4 admin-file directory exists
+  file:
+    path: "{{ package_dest_dir }}"
+    state: directory
+    mode: "0755"
+  changed_when: false
+  when: sas_remove_svr4 | bool
+
+- name: create pkgrm admin file
+  copy:
+    dest: "{{ package_dest_dir }}vas.admin"
+    mode: "0644"
+    content: |
+      mail=
+      instance=overwrite
+      partial=nocheck
+      runlevel=nocheck
+      idepend=nocheck
+      rdepend=nocheck
+      space=nocheck
+      setuid=nocheck
+      conflict=nocheck
+      action=nocheck
+      basedir=default
+  changed_when: false
+  when: sas_remove_svr4 | bool
+
+- name: "remove {{ package }} (SVR4)"
+  shell:
+    cmd: "yes | pkgrm -a '{{ package_dest_dir }}vas.admin' '{{ package }}'"
+  register: pkg_remove
+  changed_when: pkg_remove.rc == 0
+  when: sas_remove_svr4 | bool

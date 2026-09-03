@@ -106,7 +106,7 @@
     - package in client_sw_pkgs['packages']
     - state == 'present'
     - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] 
-    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] < client_sw_pkgs['packages'][package]['vers']
+    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] is version(client_sw_pkgs['packages'][package]['vers'], '<')
 
 # Handle downgrade
 - name: downgrade {{ package }}
@@ -135,7 +135,41 @@
     - package in client_sw_pkgs['packages']
     - state == 'present'
     - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] 
-    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] > client_sw_pkgs['packages'][package]['vers']
+    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] is version(client_sw_pkgs['packages'][package]['vers'], '>')
+
+# Handle migration (same version, but installed in a different packaging system)
+# Currently this covers a Solaris 11 host still registered in SVR4 from an older
+# release of this collection: the version matches the media so install/upgrade/
+# downgrade do not fire, but the package must still be migrated to the native
+# IPS package (the OS install task performs the SVR4 removal + IPS install).
+- name: migrate {{ package }}
+  block:
+
+    - include_tasks: os/{{ ansible_facts['os_family'] | lower }}/install.yml
+
+    - include_tasks: utils/set_state.yml
+      vars:
+        flag: act
+        value: upgraded
+      when: client_sw_reports_generate or client_sw_facts_generate
+
+  rescue:
+
+    - include_tasks: utils/set_state.yml
+      vars:
+        flag: act
+        value: failed
+      when: client_sw_reports_generate or client_sw_facts_generate
+
+    - fail:
+        msg: failed to migrate {{ package }} package
+
+  when:
+    - package in client_sw_pkgs['packages']
+    - state == 'present'
+    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_pkgsys'] | default('') == 'svr4'
+    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg']
+    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] is version(client_sw_pkgs['packages'][package]['vers'], '==')
 
 # Handle no action 
 - include_tasks: utils/set_state.yml
