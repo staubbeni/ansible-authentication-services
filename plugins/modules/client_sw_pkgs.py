@@ -429,6 +429,11 @@ def _p5p_packages(archive_path):
     version is URL-quoted and carries the build branch after a comma, for
     example '1.4.0.70%2C5.11-0%3A...' -> release '1.4.0.70'. This avoids
     assuming package membership or version from the archive file name.
+
+    Returns a tuple (err, packages). 'err' is a message (including the archive
+    path) when the archive cannot be opened or read, so discovery can fail
+    loudly instead of silently returning an empty set and skipping packages the
+    archive was expected to provide.
     """
 
     packages = {}
@@ -445,13 +450,14 @@ def _p5p_packages(archive_path):
                 if (pkg_name not in packages
                         or _version_key(vers) > _version_key(packages[pkg_name])):
                     packages[pkg_name] = vers
-    except (tarfile.TarError, OSError, IOError):
-        packages = {}
+    except (tarfile.TarError, OSError, IOError) as read_err:
+        return ('Unable to read Solaris IPS package archive '
+                + archive_path + ': ' + str(read_err)), {}
     finally:
         if tar is not None:
             tar.close()
 
-    return packages
+    return None, packages
 
 
 # ------------------------------------------------------------------------------
@@ -476,7 +482,10 @@ def find_packages_solaris_ips(sw_path, arch):
 
     for archive in sorted(glob.glob(os.path.join(base, '*.p5p'))):
         fname = os.path.basename(archive)
-        for pkg_name, vers in _p5p_packages(archive).items():
+        perr, archive_pkgs = _p5p_packages(archive)
+        if perr:
+            return perr, {}
+        for pkg_name, vers in archive_pkgs.items():
             existing = packages.get(pkg_name)
             if existing is None \
                     or _version_key(vers) > _version_key(existing['vers']):

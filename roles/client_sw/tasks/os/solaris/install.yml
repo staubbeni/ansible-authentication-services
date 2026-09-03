@@ -28,16 +28,45 @@
     sas_solaris_is_ips: >-
       {{ ansible_facts['distribution_major_version']
          is version('11', '>=') }}
-    sas_pkgsys: >-
-      {{ hostvars[inventory_hostname]['sas_client_sw_' ~ package ~ '_pkgsys']
-         | default('') }}
 
 # Copy the discovered install archive/package to the target. On Solaris 11 this
 # is the shared sas-*.p5p; on Solaris 10 it is the per-package .pkg.
 - include_tasks: package_copy.yml
 
+# On Solaris 11, decide whether a GENUINE legacy SVR4 install must be removed
+# before the IPS install. Probe the LIVE state (rather than a cached fact) so
+# this is idempotent - it is safe to run this file more than once for the same
+# package (for example the downgrade path removes the package first, then
+# installs). A package is a genuine legacy SVR4 install only when 'pkginfo'
+# finds it AND 'pkg info' does not: on Solaris 11 'pkginfo' also lists IPS
+# packages, so probing 'pkginfo' alone would pkgrm the live IPS package on an
+# ordinary reinstall/upgrade.
+- name: "check {{ package }} IPS registration"
+  command:
+    cmd: "pkg info '{{ package }}'"
+  register: sas_ips_present
+  changed_when: false
+  failed_when: false
+  when: sas_solaris_is_ips | bool
+
+- name: "check {{ package }} SVR4 registration"
+  command:
+    cmd: "pkginfo '{{ package }}'"
+  register: sas_svr4_present
+  changed_when: false
+  failed_when: false
+  when: sas_solaris_is_ips | bool
+
+- name: "flag {{ package }} as a genuine legacy SVR4 install"
+  set_fact:
+    sas_migrate_svr4: >-
+      {{ (sas_svr4_present.rc | default(1)) == 0
+         and (sas_ips_present.rc | default(1)) != 0 }}
+  when: sas_solaris_is_ips | bool
+
 # The admin file lets pkgadd/pkgrm run non-interactively while still executing
-# the SVR4 request script (unlike 'pkgadd -n'/'pkgrm -n').
+# the SVR4 request script (unlike 'pkgadd -n'/'pkgrm -n'). It is needed for the
+# Solaris 10 pkgadd and for the Solaris 11 SVR4 -> IPS migration pkgrm.
 - name: create SVR4 admin file
   copy:
     dest: "{{ package_dest_dir }}vas.admin"
@@ -57,7 +86,7 @@
   changed_when: false
   when: >-
     not (sas_solaris_is_ips | bool)
-    or sas_pkgsys == 'svr4'
+    or (sas_migrate_svr4 | default(false) | bool)
 
 # ------------------------------------------------------------------------------
 # Solaris 11+ : native IPS install (with legacy SVR4 -> IPS migration)
@@ -69,7 +98,7 @@
   changed_when: true
   when:
     - sas_solaris_is_ips | bool
-    - sas_pkgsys == 'svr4'
+    - sas_migrate_svr4 | default(false) | bool
 
 - name: "install {{ package }} from IPS archive"
   command:

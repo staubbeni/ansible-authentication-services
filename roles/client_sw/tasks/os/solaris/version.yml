@@ -3,16 +3,25 @@
 # ------------------------------------------------------------------------------
 # Solaris - grab package version
 #
-# A host may have the package registered in either database:
+# A host may have the package registered as:
 #   * IPS   ('pkg info')   - Solaris 11 native, installed by this role
 #   * SVR4  ('pkginfo')    - Solaris 10, or a Solaris 11 host installed by an
 #                            older version of this collection (legacy .pkg)
 #
-# Probe both, prefer IPS when present, and expose which packaging system holds
-# the package so the install/upgrade path can migrate a legacy SVR4 install to
-# IPS on Solaris 11. A clean version string is handed to set_version.yml via
-# pkg_version.stdout so the shared parser cannot latch onto an FMRI fragment
-# (e.g. the '5.11' build-branch component).
+# IMPORTANT: on Solaris 11 the legacy 'pkginfo' command also reports IPS
+# packages (it is a compatibility VIEW over IPS, not a separate database):
+# 'pkginfo vasclnts' succeeds for an IPS install and stops succeeding once the
+# IPS package is uninstalled. 'pkginfo' therefore cannot be used on its own to
+# decide "is this a legacy SVR4 install". A package is treated as a GENUINE
+# legacy SVR4 install only when 'pkginfo' finds it AND 'pkg info' does NOT; when
+# 'pkg info' finds it the package is IPS and the 'pkginfo' hit is just the IPS
+# legacy view. This makes the two states mutually exclusive and keeps an
+# ordinary IPS install idempotent (otherwise every rerun would treat it as SVR4
+# and pkgrm the live IPS package).
+#
+# A clean version string is handed to set_version.yml via pkg_version.stdout so
+# the shared parser cannot latch onto an FMRI fragment (e.g. the '5.11'
+# build-branch component).
 # ------------------------------------------------------------------------------
 
 - name: "get {{ package }} IPS version"
@@ -37,15 +46,35 @@
           | regex_findall('Version:\s*([0-9][0-9.]*)')
           | first | default('', true))
          if (sas_ips_info.rc | default(1)) == 0 else '' }}
+    # A GENUINE legacy SVR4 install is one that 'pkginfo' finds but 'pkg info'
+    # does NOT - if IPS owns the package the 'pkginfo' hit is only the IPS
+    # legacy view (see the note above), so it is not a separate SVR4 install.
     sas_svr4_ver: >-
       {{ (sas_svr4_info.stdout | default('', true)
           | regex_findall('VERSION:\s*([0-9][0-9.]*)')
           | first | default('', true))
-         if (sas_svr4_info.rc | default(1)) == 0 else '' }}
+         if ((sas_svr4_info.rc | default(1)) == 0
+             and (sas_ips_info.rc | default(1)) != 0) else '' }}
 
 - name: "record {{ package }} version and packaging system"
   set_fact:
+    # IPS is preferred for routing; the two states are mutually exclusive so
+    # this only falls back to the SVR4 version for a genuine legacy install.
     pkg_version:
       stdout: "{{ sas_ips_ver if sas_ips_ver else sas_svr4_ver }}"
+    # Presence of each packaging system. 'svr4' means a genuine legacy SVR4
+    # install (pkginfo yes, pkg info no); an IPS install is 'ips' only, even
+    # though 'pkginfo' would also list it.
+    "sas_client_sw_{{ package }}_ips": "{{ (sas_ips_ver | length) > 0 }}"
+    "sas_client_sw_{{ package }}_svr4": "{{ (sas_svr4_ver | length) > 0 }}"
+    # 'ips', 'svr4' or '' - kept for reporting.
     "sas_client_sw_{{ package }}_pkgsys": >-
-      {{ 'ips' if sas_ips_ver else ('svr4' if sas_svr4_ver else '') }}
+      {{ 'ips' if sas_ips_ver
+         else ('svr4' if sas_svr4_ver else '') }}
+    # Migration is required only when a genuine legacy SVR4 install is present on
+    # a platform whose native system is IPS (Solaris 11). On Solaris 10 the
+    # native system is SVR4, so this is false and an equal-version rerun does
+    # nothing instead of reinstalling the SVR4 package on every run.
+    "sas_client_sw_{{ package }}_migrate": >-
+      {{ (ansible_facts['distribution_major_version'] is version('11', '>='))
+         and ((sas_svr4_ver | length) > 0) }}

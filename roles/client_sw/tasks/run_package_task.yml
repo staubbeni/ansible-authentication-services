@@ -137,11 +137,15 @@
     - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] 
     - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] is version(client_sw_pkgs['packages'][package]['vers'], '>')
 
-# Handle migration (same version, but installed in a different packaging system)
-# Currently this covers a Solaris 11 host still registered in SVR4 from an older
+# Handle migration (installed version already matches the media, but the package
+# is registered in a packaging system that is not the platform's native one).
+# The OS version task sets '<pkg>_migrate' true only when such a conversion is
+# needed - currently a Solaris 11 host still registered in SVR4 from an older
 # release of this collection: the version matches the media so install/upgrade/
 # downgrade do not fire, but the package must still be migrated to the native
-# IPS package (the OS install task performs the SVR4 removal + IPS install).
+# IPS package (the OS install task performs the SVR4 removal + IPS install). On
+# Solaris 10 the native system is SVR4, so '<pkg>_migrate' is false there and an
+# equal-version rerun correctly does nothing.
 - name: migrate {{ package }}
   block:
 
@@ -167,7 +171,7 @@
   when:
     - package in client_sw_pkgs['packages']
     - state == 'present'
-    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_pkgsys'] | default('') == 'svr4'
+    - hostvars[inventory_hostname]['sas_client_sw_' + package + '_migrate'] | default(false) | bool
     - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg']
     - hostvars[inventory_hostname]['sas_client_sw_' + package + '_vers_beg'] is version(client_sw_pkgs['packages'][package]['vers'], '==')
 

@@ -4,8 +4,12 @@
 # Solaris - downgrade package
 #
 # Neither SVR4 nor 'pkg install -g' downgrades a package in place, so remove the
-# installed package then install the target version. On Solaris 11 remove.yml
-# uses 'pkg uninstall' and install.yml uses 'pkg install -g'.
+# currently installed package(s) then install the target version. remove.yml
+# cleans whichever database holds the package (IPS and/or SVR4). install.yml
+# then installs the target; its SVR4 -> IPS migration step probes the live SVR4
+# state, so it is a safe no-op here even though remove.yml has already cleared
+# any SVR4 registration - this avoids a double pkgrm when a legacy SVR4 package
+# on Solaris 11 is downgraded to older IPS media.
 # ------------------------------------------------------------------------------
 
 - include_tasks: "remove.yml"
