@@ -74,5 +74,18 @@
   shell:
     cmd: "yes | pkgrm -a '{{ package_dest_dir }}vas.admin' '{{ package }}'"
   register: pkg_remove_svr4
-  changed_when: pkg_remove_svr4.rc == 0
+  # pkgrm(1M) documents 2 (warning) and 10/20 (reboot required) as completed
+  # outcomes in addition to 0; accept them (as community.general.svr4pkg does)
+  # so a completed removal is not reported as a failure.
+  changed_when: pkg_remove_svr4.rc in [0, 2, 10, 20]
+  failed_when: pkg_remove_svr4.rc not in [0, 2, 10, 20]
   when: sas_have_svr4 | bool
+
+- name: "note {{ package }} SVR4 removal reboot/warning status"
+  debug:
+    msg: >-
+      pkgrm for {{ package }} completed with return code {{ pkg_remove_svr4.rc }}
+      ({{ 'reboot required' if pkg_remove_svr4.rc in [10, 20] else 'warning' }}).
+  when:
+    - sas_have_svr4 | bool
+    - pkg_remove_svr4.rc | default(0) in [2, 10, 20]

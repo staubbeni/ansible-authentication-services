@@ -431,9 +431,10 @@ def _p5p_packages(archive_path):
     assuming package membership or version from the archive file name.
 
     Returns a tuple (err, packages). 'err' is a message (including the archive
-    path) when the archive cannot be opened or read, so discovery can fail
-    loudly instead of silently returning an empty set and skipping packages the
-    archive was expected to provide.
+    path) when the archive cannot be opened or read, OR when it is readable but
+    contains no recognized package manifests (a corrupt or incomplete .p5p), so
+    discovery can fail loudly instead of silently returning an empty set and
+    skipping packages the archive was expected to provide.
     """
 
     packages = {}
@@ -456,6 +457,15 @@ def _p5p_packages(archive_path):
     finally:
         if tar is not None:
             tar.close()
+
+    # A readable archive that yields no package manifests is corrupt or
+    # incomplete media. Report it rather than let it contribute nothing while
+    # other archives make aggregate discovery look successful - that would let a
+    # requested package be silently skipped.
+    if not packages:
+        return ('Solaris IPS package archive ' + archive_path
+                + ' contains no package manifests (corrupt or incomplete '
+                'media)'), {}
 
     return None, packages
 

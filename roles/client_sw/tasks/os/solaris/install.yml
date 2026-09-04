@@ -47,6 +47,8 @@
   register: sas_ips_present
   changed_when: false
   failed_when: false
+  environment:
+    LC_ALL: C
   when: sas_solaris_is_ips | bool
 
 - name: "check {{ package }} SVR4 registration"
@@ -55,7 +57,37 @@
   register: sas_svr4_present
   changed_when: false
   failed_when: false
+  environment:
+    LC_ALL: C
   when: sas_solaris_is_ips | bool
+
+# Fail closed on an inconclusive probe: only the recognised not-installed
+# message may authorise treating a database as empty. An operational error must
+# not be read as "IPS absent" and let the migration pkgrm below remove a live
+# IPS package.
+- name: "verify {{ package }} IPS probe is conclusive"
+  fail:
+    msg: >-
+      Could not determine the IPS registration of {{ package }}: 'pkg info'
+      exited {{ sas_ips_present.rc }} with unexpected output -
+      {{ (sas_ips_present.stderr | default('') | trim)
+         or (sas_ips_present.stdout | default('') | trim) }}
+  when:
+    - sas_solaris_is_ips | bool
+    - (sas_ips_present.rc | default(1)) != 0
+    - not (sas_ips_present.stderr | default('') is search('no packages matching'))
+
+- name: "verify {{ package }} SVR4 probe is conclusive"
+  fail:
+    msg: >-
+      Could not determine the SVR4 registration of {{ package }}: 'pkginfo'
+      exited {{ sas_svr4_present.rc }} with unexpected output -
+      {{ (sas_svr4_present.stderr | default('') | trim)
+         or (sas_svr4_present.stdout | default('') | trim) }}
+  when:
+    - sas_solaris_is_ips | bool
+    - (sas_svr4_present.rc | default(1)) != 0
+    - not (sas_svr4_present.stderr | default('') is search('was not found'))
 
 - name: "flag {{ package }} as a genuine legacy SVR4 install"
   set_fact:
@@ -95,10 +127,25 @@
   shell:
     cmd: "yes | pkgrm -a '{{ package_dest_dir }}vas.admin' '{{ package }}'"
   register: sas_svr4_migrate
-  changed_when: true
+  # pkgrm(1M) documents 2 (warning) and 10/20 (reboot required) as completed
+  # outcomes in addition to 0; accept them (as community.general.svr4pkg does)
+  # so a completed removal is not sent to 'rescue'.
+  changed_when: sas_svr4_migrate.rc in [0, 2, 10, 20]
+  failed_when: sas_svr4_migrate.rc not in [0, 2, 10, 20]
   when:
     - sas_solaris_is_ips | bool
     - sas_migrate_svr4 | default(false) | bool
+
+- name: "note {{ package }} SVR4 removal reboot/warning status"
+  debug:
+    msg: >-
+      pkgrm for {{ package }} completed with return code
+      {{ sas_svr4_migrate.rc }}
+      ({{ 'reboot required' if sas_svr4_migrate.rc in [10, 20] else 'warning' }}).
+  when:
+    - sas_solaris_is_ips | bool
+    - sas_migrate_svr4 | default(false) | bool
+    - sas_svr4_migrate.rc | default(0) in [2, 10, 20]
 
 - name: "install {{ package }} from IPS archive"
   command:
@@ -123,5 +170,18 @@
       yes | pkgadd -a '{{ package_dest_dir }}vas.admin'
       -G -d '{{ package_dest }}' '{{ package }}'
   register: pkg_install
-  changed_when: pkg_install.rc == 0
+  # pkgadd(1M) documents 2 (warning) and 10/20 (reboot required) as completed
+  # outcomes in addition to 0; accept them (as community.general.svr4pkg does)
+  # so a completed install is not reported as a failure.
+  changed_when: pkg_install.rc in [0, 2, 10, 20]
+  failed_when: pkg_install.rc not in [0, 2, 10, 20]
   when: not (sas_solaris_is_ips | bool)
+
+- name: "note {{ package }} pkgadd reboot/warning status"
+  debug:
+    msg: >-
+      pkgadd for {{ package }} completed with return code {{ pkg_install.rc }}
+      ({{ 'reboot required' if pkg_install.rc in [10, 20] else 'warning' }}).
+  when:
+    - not (sas_solaris_is_ips | bool)
+    - pkg_install.rc | default(0) in [2, 10, 20]

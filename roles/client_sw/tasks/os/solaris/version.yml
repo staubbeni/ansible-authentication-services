@@ -30,6 +30,8 @@
   register: sas_ips_info
   changed_when: false
   failed_when: false
+  environment:
+    LC_ALL: C
   when: ansible_facts['distribution_major_version'] is version('11', '>=')
 
 - name: "get {{ package }} SVR4 version"
@@ -38,6 +40,37 @@
   register: sas_svr4_info
   changed_when: false
   failed_when: false
+  environment:
+    LC_ALL: C
+
+# Distinguish "not installed" from an operational probe failure. Both 'pkg info'
+# and 'pkginfo' exit non-zero when the package is simply absent, but a transient
+# or operational error must NOT be read as absence: absence of IPS is later used
+# to authorise a migration pkgrm, so failing open here could remove a live IPS
+# package. Only the recognised not-installed message maps to absent; any other
+# non-zero result fails the role (LC_ALL=C above keeps these messages stable).
+- name: "verify {{ package }} IPS probe is conclusive"
+  fail:
+    msg: >-
+      Could not determine the IPS registration of {{ package }}: 'pkg info'
+      exited {{ sas_ips_info.rc }} with unexpected output -
+      {{ (sas_ips_info.stderr | default('') | trim)
+         or (sas_ips_info.stdout | default('') | trim) }}
+  when:
+    - ansible_facts['distribution_major_version'] is version('11', '>=')
+    - (sas_ips_info.rc | default(1)) != 0
+    - not (sas_ips_info.stderr | default('') is search('no packages matching'))
+
+- name: "verify {{ package }} SVR4 probe is conclusive"
+  fail:
+    msg: >-
+      Could not determine the SVR4 registration of {{ package }}: 'pkginfo'
+      exited {{ sas_svr4_info.rc }} with unexpected output -
+      {{ (sas_svr4_info.stderr | default('') | trim)
+         or (sas_svr4_info.stdout | default('') | trim) }}
+  when:
+    - (sas_svr4_info.rc | default(1)) != 0
+    - not (sas_svr4_info.stderr | default('') is search('was not found'))
 
 - name: "determine {{ package }} version and packaging system"
   set_fact:
