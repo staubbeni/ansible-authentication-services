@@ -3,10 +3,10 @@
 # ------------------------------------------------------------------------------
 # Solaris - upgrade package
 #
-#   * Solaris 11+ : 'pkg install -g' performs the upgrade in place (and migrates
-#                   a legacy SVR4 install to IPS), so reuse install.yml. This
-#                   avoids uninstalling a package before its dependents on the
-#                   native IPS path.
+#   * Solaris 11+ : the native IPS install performs the upgrade in place (and
+#                   migrates a legacy SVR4 install to IPS), so reuse install.yml.
+#                   This avoids uninstalling a package before its dependents on
+#                   the native IPS path.
 #   * Solaris 10  : SVR4 has no in-place upgrade, so remove then install.
 # ------------------------------------------------------------------------------
 

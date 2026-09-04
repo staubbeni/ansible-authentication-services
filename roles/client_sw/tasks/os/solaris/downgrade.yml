@@ -3,7 +3,7 @@
 # ------------------------------------------------------------------------------
 # Solaris - downgrade package
 #
-# Neither SVR4 nor 'pkg install -g' downgrades a package in place, so remove the
+# Neither SVR4 nor the native IPS install downgrades a package in place, so remove the
 # currently installed package(s) then install the target version. remove.yml
 # cleans whichever database holds the package (IPS and/or SVR4). install.yml
 # then installs the target; its SVR4 -> IPS migration step probes the live SVR4

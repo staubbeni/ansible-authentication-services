@@ -20,8 +20,8 @@
 #       - macos-1012 (*.dmg)            # Multiple install packages in single dmg
 #       - solaris10-sparc (*.pkg)         # SVR4, interactive pkgadd
 #       - solaris10-x64 (*.pkg)           # SVR4, interactive pkgadd
-#       - solaris11-sparc (sas-*.p5p)     # IPS, pkg install -g
-#       - solaris11-x64 (sas-*.p5p)       # IPS, pkg install -g
+#       - solaris11-sparc (sas-*.p5p)     # IPS archive
+#       - solaris11-x64 (sas-*.p5p)       # IPS archive
 
 # NOTE: Ansible has following package managers implemented: 
 #       - Linux (*.deb) = apt 

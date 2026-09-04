@@ -361,7 +361,7 @@ def find_packages(sw_path, sys, dist, arch, ver=''):
     # Solaris 11 and later ship Authentication Services as a native IPS package
     # archive (sas-*.p5p) rather than SVR4 datastream packages (*.pkg). Discover
     # the archive and report the component packages it provides so the install
-    # path can use 'pkg install -g <archive>'.
+    # path can install the archive directly or configure it as an IPS origin.
     if sys == 'sunos' and _solaris_major(ver) >= 11:
         return find_packages_solaris_ips(sw_path, arch)
 
