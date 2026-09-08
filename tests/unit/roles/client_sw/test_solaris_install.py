@@ -23,6 +23,8 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 SOLARIS = ROOT / "roles/client_sw/tasks/os/solaris"
 PLAYBOOK = os.environ.get("SOLARIS_TEST_ANSIBLE_PLAYBOOK", "ansible-playbook")
 TARGET_VERSION = "7.1.0.1000"
+NEWER_CATALOG_VERSION = "9.0.0.1000"
+LINKED_CHILD = "zone:sample child /zones/sample/root\n"
 
 
 def walk_tasks(tasks):
@@ -42,10 +44,10 @@ class SolarisInstallTests(unittest.TestCase):
         self.root.chmod(0o755)
 
     def run_case(self, route="equal", registered="svr4", fault="", check=False,
-                 linked="zone:sample child /zones/sample/root\n", major="11",
+                 linked=LINKED_CHILD, major="11",
                  state="present", publisher_exists=True, publisher_enabled=True,
                  enabled_label="Publisher enabled", detail_rc=0, svr4_rc=0,
-                 packages=("vasclnt",)):
+                 packages=("vasclnt",), newer_catalog_version=""):
         sandbox = Path(tempfile.mkdtemp(dir=str(self.root)))
         sandbox.chmod(0o755)
         for name in ("stage-root", "controller", "actions", "bin", "local-tmp"):
@@ -94,6 +96,7 @@ class SolarisInstallTests(unittest.TestCase):
                 } for package in packages
             },
             "target_version": TARGET_VERSION,
+            "newer_catalog_version": newer_catalog_version,
             "linked": linked, "publisher_exists": publisher_exists,
             "publisher_enabled": publisher_enabled,
             "enabled_label": enabled_label, "detail_rc": detail_rc,
@@ -106,6 +109,9 @@ class SolarisInstallTests(unittest.TestCase):
             "publisher_queries": 0, "temp_origin": None,
             "events": [], "commands": [], "stages": [], "cleaned": [],
             "worker_checks": [],
+        }
+        initial_installed = {
+            package: dict(installed) for package, installed in data["installed"].items()
         }
         state_path = sandbox / "state.json"
         state_path.write_text(json.dumps(data))
@@ -149,6 +155,7 @@ class SolarisInstallTests(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90,
         )
         data = json.loads(state_path.read_text())
+        data["initial_installed"] = initial_installed
         data["sandbox"] = sandbox
         data["old_archive"] = old_archive
         data["source"] = source
@@ -162,6 +169,13 @@ class SolarisInstallTests(unittest.TestCase):
             event for event in data["commands"]
             if "pkgrm" in event["argv"]
             or event["argv"][:2] == ["pkg", "uninstall"]
+        ]
+
+    @staticmethod
+    def ips_installs(data):
+        return [
+            event for event in data["commands"]
+            if event["argv"][:2] == ["pkg", "install"]
         ]
 
     @staticmethod
@@ -213,11 +227,17 @@ class SolarisInstallTests(unittest.TestCase):
             with self.subTest(registered=registered, route=route):
                 completed, data = self.run_case(registered=registered, route=route)
                 self.assert_success(completed)
-                self.assertEqual(len(self.removals(data)), 1)
-                self.assertEqual(data["installed"]["vasclnt"]["system"], "ips")
+                self.assertEqual(len(self.removals(data)),
+                                 1 if registered == "svr4" else 0)
+                self.assertTrue(all("pkgrm" in event["argv"]
+                                    for event in self.removals(data)))
+                self.assertEqual(data["installed"]["vasclnt"], {
+                    "system": "ips", "version": TARGET_VERSION,
+                })
                 self.assertEqual(data["stages"], data["cleaned"])
                 self.assertEqual(len(data["stages"]), 1)
                 self.assertFalse(Path(data["stages"][0]).exists())
+                self.assertEqual(len(data["worker_checks"]), 1)
                 worker = data["worker_checks"][0]
                 self.assertTrue(worker["read"])
                 self.assertEqual(worker["directory_mode"], 0o755)
@@ -228,8 +248,12 @@ class SolarisInstallTests(unittest.TestCase):
                 commands = [event["argv"] for event in data["commands"]]
                 worker_index = next(i for i, cmd in enumerate(commands)
                                     if len(cmd) == 4 and cmd[1] == "-c")
-                removal_index = commands.index(self.removals(data)[0]["argv"])
-                self.assertLess(worker_index, removal_index)
+                # IPS downgrade has no removal. Worker access must still
+                # precede EVERY package/publisher mutation, including install.
+                for mutation in (self.removals(data) + self.publisher_mutations(data)
+                                 + self.ips_installs(data)):
+                    self.assertLess(worker_index, commands.index(mutation["argv"]),
+                                    mutation)
                 self.assertIn([
                     "pkg", "install", "--accept",
                     "pkg://OneIdentity/vasclnt@" + TARGET_VERSION,
@@ -260,14 +284,86 @@ class SolarisInstallTests(unittest.TestCase):
                 )
                 self.assertGreater(cleanup, last_publisher)
 
-    def test_downgrade_refresh_prevents_a_second_pkgrm(self):
+    def test_downgrade_live_probes_precede_single_pkgrm(self):
         completed, data = self.run_case(route="downgrade")
         self.assert_success(completed)
-        commands = [event["argv"] for event in data["commands"]]
-        removal = commands.index(self.removals(data)[0]["argv"])
-        self.assertIn(["pkg", "info", "vasclnt"], commands[removal + 1:])
-        self.assertIn(["pkginfo", "vasclnt"], commands[removal + 1:])
         self.assertEqual(len(self.removals(data)), 1)
+        self.assertIn("pkgrm", self.removals(data)[0]["argv"])
+        commands = [event["argv"] for event in data["commands"]]
+        worker = next(i for i, cmd in enumerate(commands)
+                      if len(cmd) == 4 and cmd[1] == "-c")
+        removal = commands.index(self.removals(data)[0]["argv"])
+        for probe in (["pkg", "info", "vasclnt"], ["pkginfo", "vasclnt"]):
+            # Ignore the cached version probes before preflight: the helper's
+            # live probes must authorise migration, not follow remove.yml.
+            probe_index = commands.index(probe, worker + 1)
+            self.assertLess(worker, probe_index)
+            self.assertLess(probe_index, removal)
+        self.assertTrue(self.removals(data)[0]["task"].endswith(
+            "migrate legacy SVR4 vasclnt to IPS"
+        ))
+        self.assertEqual(len(self.ips_installs(data)), 1)
+        self.assertLess(removal, commands.index(self.ips_installs(data)[0]["argv"]))
+        self.assertEqual(data["installed"]["vasclnt"], {
+            "system": "ips", "version": TARGET_VERSION,
+        })
+
+    def test_ips_downgrade_installs_requested_version_without_uninstall(self):
+        for linked in ("", LINKED_CHILD):
+            with self.subTest(linked=linked):
+                completed, data = self.run_case(
+                    route="downgrade", registered="ips", linked=linked,
+                )
+                self.assert_success(completed)
+                self.assertEqual(self.removals(data), [])
+                self.assertEqual(len(self.ips_installs(data)), 1)
+                self.assertEqual(self.ips_installs(data)[0]["argv"][-1],
+                                 "pkg://OneIdentity/vasclnt@" + TARGET_VERSION)
+                self.assertEqual(data["installed"]["vasclnt"], {
+                    "system": "ips", "version": TARGET_VERSION,
+                })
+                self.assertIsNone(data["temp_origin"])
+                self.assertEqual(data["stages"], data["cleaned"])
+
+    def test_failed_ips_transitions_preserve_original_version_and_system(self):
+        for route in ("upgrade", "downgrade"):
+            for linked in ("", LINKED_CHILD):
+                with self.subTest(route=route, linked=linked):
+                    completed, data = self.run_case(
+                        route=route, registered="ips", linked=linked,
+                        fault="install", publisher_enabled=False,
+                    )
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                    self.assertIn("stub package install error", completed.stdout)
+                    self.assertEqual(data["installed"], data["initial_installed"])
+                    self.assertEqual(self.removals(data), [])
+                    self.assertEqual(len(self.ips_installs(data)), 1)
+                    self.assertFalse(data["publisher_enabled"])
+                    self.assertIsNone(data["temp_origin"])
+                    self.assertEqual(data["stages"], data["cleaned"])
+
+    def test_direct_installs_pin_media_version_despite_newer_catalog(self):
+        for route in ("install", "upgrade", "downgrade"):
+            with self.subTest(route=route):
+                completed, data = self.run_case(
+                    route=route, registered="ips", linked="",
+                    newer_catalog_version=NEWER_CATALOG_VERSION,
+                )
+                self.assert_success(completed)
+                # The stub selects the newer catalog release for an
+                # unversioned operand, rather than always forcing the media.
+                self.assertEqual(data["installed"]["vasclnt"], {
+                    "system": "ips", "version": TARGET_VERSION,
+                })
+                self.assertEqual(
+                    [event["argv"] for event in self.ips_installs(data)], [[
+                        "pkg", "install", "--accept", "-g",
+                        str(data["old_archive"]),
+                        "pkg://OneIdentity/vasclnt@" + TARGET_VERSION,
+                    ]],
+                )
+                self.assertEqual(self.removals(data), [])
+                self.assertEqual(self.publisher_mutations(data), [])
 
     def test_restore_enabled_state_origins_and_proxies_with_both_detail_labels(self):
         for label in ("Enabled", "Publisher enabled"):
@@ -360,11 +456,11 @@ class SolarisInstallTests(unittest.TestCase):
                 self.assertEqual(data["publisher_queries"], 0)
                 self.assertEqual(data["stages"], [])
                 self.assertEqual(len(self.removals(data)), 1)
-                installs = [event["argv"] for event in data["commands"]
-                            if event["argv"][:2] == ["pkg", "install"]]
+                installs = [event["argv"] for event in self.ips_installs(data)]
                 self.assertEqual(installs, [[
                     "pkg", "install", "--accept", "-g",
-                    str(data["old_archive"]), "vasclnt",
+                    str(data["old_archive"]),
+                    "pkg://OneIdentity/vasclnt@" + TARGET_VERSION,
                 ]])
 
     def test_ips_compatibility_registration_does_not_trigger_pkgrm(self):
@@ -389,17 +485,26 @@ class SolarisInstallTests(unittest.TestCase):
         self.assertEqual(self.removals(data), [])
         self.assertEqual(data["publisher_queries"], 0)
 
-    def test_solaris10_upgrade_keeps_interactive_completed_svr4_outcomes(self):
-        for rc in (0, 2, 10, 20):
-            with self.subTest(rc=rc):
-                completed, data = self.run_case(major="10", route="upgrade", svr4_rc=rc)
-                self.assert_success(completed)
-                self.assertEqual(len(self.removals(data)), 1)
-                commands = [event["argv"] for event in data["commands"]]
-                self.assertTrue(any("pkgadd" in cmd for cmd in commands))
-                self.assertFalse(any("-n" in cmd for cmd in commands))
-                self.assertFalse(any(cmd[0] == "pkg" for cmd in commands))
-                self.assertEqual(data["stages"], [])
+    def test_solaris10_transitions_keep_interactive_completed_svr4_outcomes(self):
+        for route in ("upgrade", "downgrade"):
+            for rc in (0, 2, 10, 20):
+                with self.subTest(route=route, rc=rc):
+                    completed, data = self.run_case(
+                        major="10", route=route, svr4_rc=rc,
+                    )
+                    self.assert_success(completed)
+                    self.assertEqual(len(self.removals(data)), 1)
+                    commands = [event["argv"] for event in data["commands"]]
+                    installs = [cmd for cmd in commands if "pkgadd" in cmd]
+                    self.assertEqual(len(installs), 1)
+                    self.assertLess(commands.index(self.removals(data)[0]["argv"]),
+                                    commands.index(installs[0]))
+                    self.assertFalse(any("-n" in cmd for cmd in commands))
+                    self.assertFalse(any(cmd[0] == "pkg" for cmd in commands))
+                    self.assertEqual(data["installed"]["vasclnt"], {
+                        "system": "svr4", "version": TARGET_VERSION,
+                    })
+                    self.assertEqual(data["stages"], [])
 
     def test_second_package_cannot_reuse_first_packages_cleanup_markers(self):
         completed, data = self.run_case(
@@ -421,6 +526,21 @@ class SolarisInstallTests(unittest.TestCase):
 
 
 class SolarisTaskContractTests(unittest.TestCase):
+    def test_both_ips_install_paths_keep_rc_zero_and_four_handling(self):
+        installs = [
+            task for task in walk_tasks(
+                yaml.safe_load((SOLARIS / "install_package.yml").read_text())
+            )
+            if task.get("command", {}).get("cmd", "").startswith("pkg install ")
+        ]
+        self.assertEqual(len(installs), 2)
+        for task in installs:
+            with self.subTest(task=task["name"]):
+                self.assertEqual(task["changed_when"], "pkg_install.rc == 0")
+                self.assertEqual(task["failed_when"], [
+                    "pkg_install.rc != 0", "pkg_install.rc != 4",
+                ])
+
     def test_all_four_registration_probes_keep_check_mode_and_locale_guards(self):
         probes = []
         for filename in ("version.yml", "install_package.yml"):

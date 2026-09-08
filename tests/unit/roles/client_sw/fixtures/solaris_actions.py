@@ -262,10 +262,16 @@ class ActionModule(ActionBase):
         if "pkgadd" in argv or argv[:2] == ["pkg", "install"]:
             if fault == "install":
                 return self.result(1, stderr="stub package install error")
-            package = argv[-1].split("/")[-1].split("@")[0]
+            package, separator, requested_version = argv[-1].split("/")[-1].partition("@")
+            version = requested_version or self.state["target_version"]
+            # Model release selection only, not the full IPS solver. Adding
+            # an archive with -g leaves newer configured catalogs competing;
+            # only a version-qualified operand constrains the requested release.
+            if argv[:2] == ["pkg", "install"] and "-g" in argv and not separator:
+                version = self.state["newer_catalog_version"] or version
             self.state["installed"][package].update(
                 system="svr4" if "pkgadd" in argv else "ips",
-                version=self.state["target_version"],
+                version=version,
             )
             return self.result(self.state["svr4_rc"] if "pkgadd" in argv else 0)
 

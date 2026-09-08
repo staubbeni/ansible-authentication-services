@@ -1,8 +1,8 @@
 ---
 
-# One operation owns preflight, optional downgrade/SVR4-upgrade removal, native
-# install and archive cleanup. In particular, downgrade must not call remove.yml
-# before checking the linked-image publisher and the REQUIRED install media.
+# One operation owns preflight, optional Solaris 10 version-transition removal,
+# native install and archive cleanup. Required media and any linked-image
+# publisher checks must precede the install or genuine SVR4 migration removal.
 # Absent-only operations still call remove.yml directly, without media checks.
 - name: reset Solaris install operation state
   set_fact:
@@ -29,9 +29,9 @@
     - include_tasks: remove.yml
       when: sas_solaris_remove_before_install | default(false) | bool
 
-    # Keep the live pkg info/pkginfo probes in this helper AFTER an optional
-    # removal: cached version facts still describe the old SVR4 install during
-    # downgrade and must not cause a second pkgrm.
+    # Solaris 11 transitions do not call remove.yml. This helper's live
+    # pkg info/pkginfo probes authorise exactly one genuine SVR4 migration
+    # removal, never pkgrm based only on cached version facts.
     - include_tasks: install_package.yml
 
   always:

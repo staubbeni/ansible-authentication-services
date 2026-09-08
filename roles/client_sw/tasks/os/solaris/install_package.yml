@@ -7,7 +7,7 @@
 #
 #   * Solaris 11+ : install natively from the IPS archive discovered by
 #                   client_sw_pkgs (sas-*.p5p). Images without linked child
-#                   zones use the ephemeral 'pkg install -g' path. Since '-g'
+#                   zones use a version-qualified 'pkg install -g'. Since '-g'
 #                   is prohibited when linked non-global zones exist, those
 #                   images temporarily configure the archive as the sole
 #                   OneIdentity publisher origin, install the exact package
@@ -16,9 +16,9 @@
 #                   (a host installed by an older release of this collection),
 #                   the legacy .pkg is removed first so the stale SVR4
 #                   registration and SMF state are cleaned up before the IPS
-#                   package is installed. The native install also upgrades an
-#                   already-IPS package in place, so the upgrade path reuses
-#                   this file.
+#                   package is installed. The native install also upgrades or
+#                   downgrades an already-IPS package in place, so both version
+#                   transitions reuse this file without uninstalling IPS first.
 #
 #   * Solaris 10  : install the SVR4 package with an interactive pkgadd
 #                   (answering 'y', no '-n') so the SVR4 request script runs and
@@ -29,12 +29,11 @@
 
 # On Solaris 11, decide whether a GENUINE legacy SVR4 install must be removed
 # before the IPS install. Probe the LIVE state (rather than a cached fact) so
-# this is idempotent - it is safe to run this file more than once for the same
-# package (for example the downgrade path removes the package first, then
-# installs). A package is a genuine legacy SVR4 install only when 'pkginfo'
+# this is idempotent - reruns must not repeat a completed migration removal.
+# A package is a genuine legacy SVR4 install only when 'pkginfo'
 # finds it AND 'pkg info' does not: on Solaris 11 'pkginfo' also lists IPS
 # packages, so probing 'pkginfo' alone would pkgrm the live IPS package on an
-# ordinary reinstall/upgrade.
+# ordinary reinstall/upgrade/downgrade.
 - name: "check {{ package }} IPS registration"
   command:
     cmd: "pkg info '{{ package }}'"
@@ -145,7 +144,11 @@
 
 - name: "install {{ package }} directly from IPS archive"
   command:
-    cmd: "pkg install --accept -g '{{ package_dest }}' '{{ package }}'"
+    # -g adds a source; it does not exclude newer configured catalog releases.
+    # Match the linked path's publisher/release constraint, not just the name.
+    cmd: >-
+      pkg install --accept -g '{{ package_dest }}'
+      'pkg://OneIdentity/{{ package }}@{{ client_sw_pkgs['packages'][package]['vers'] }}'
   register: pkg_install
   changed_when: pkg_install.rc == 0
   # pkg rc 4 == "nothing to do" (already at the requested version)

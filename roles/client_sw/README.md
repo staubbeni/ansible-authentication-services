@@ -123,19 +123,28 @@ Report generation variable defaults for all roles are set by variables in the [`
 
 ## Solaris install preflight and linked-image media
 
-Solaris install, upgrade and downgrade operations check required media before
-removing the installed package. On Solaris 11, linked-child discovery and any
-required OneIdentity publisher checks also finish before either SVR4 `pkgrm` or
-IPS uninstall. Query failures, SSL client credentials and inherited/system
-publishers (`SYSPUB=true`) reject the linked-image operation without removing the
-working package or changing its publisher. Absent-only removal does not require
-install media or these install-only checks.
+On Solaris 11, existing IPS packages upgrade or downgrade in place with one
+version-qualified `pkg install` transaction, without a preliminary `pkg uninstall`.
+IPS resolves the requested release and its dependencies together rather than the
+role removing the installed package before an install that might fail. A genuine
+legacy SVR4 package is still removed exactly once with `pkgrm`, after live IPS/SVR4
+registration probes authorise migration. Solaris 10 version transitions retain
+SVR4 removal followed by installation.
+
+Solaris install, upgrade and downgrade operations check required media before any
+package mutation. On Solaris 11, linked-child discovery and any required
+OneIdentity publisher checks also finish before installation or migration
+`pkgrm`. Query failures, SSL client credentials and inherited/system publishers
+(`SYSPUB=true`) reject the linked-image operation without removing the working
+package or changing its publisher. Absent-only removal does not require install
+media or these install-only checks.
 
 Images with actual linked **children** use a temporary publisher origin. For
 each package operation, the required archive is copied to a unique root-owned
 `/var/tmp/ansible-as-ips-*` directory (0755), with a regular archive file (0644).
 A subprocess drops privileges to the Solaris system-repository worker `pkg5srv`
-and reads the archive before any removal, checking access through all ancestors.
+and reads the archive before any package or publisher mutation, checking access
+through all ancestors.
 Caller-owned `client_sw_tmp_dir` parents and pre-existing media are not chmodded.
 The archive contains installation media, not credentials, and is intentionally
 readable by local users during the operation.
@@ -145,7 +154,10 @@ are restored after the install attempt. Only the operation's own staging directo
 is cleaned, after the temporary origin is detached. If publisher cleanup fails
 and the archive may still be in use, the role reports and retains that directory;
 restore the publisher before removing the reported path. Images without linked
-children retain `pkg install -g`; Solaris 10 retains interactive SVR4 installation.
+children retain `pkg install -g`. Both IPS paths use
+`pkg://OneIdentity/<package>@<media-release>` so newer releases in configured
+catalogs cannot override the requested media release; `-g` alone only adds a
+source. Solaris 10 retains interactive SVR4 installation.
 
 Check mode performs read-only discovery/publisher checks and checks the controller
 media source, but creates no staging directory and mutates no package or publisher.

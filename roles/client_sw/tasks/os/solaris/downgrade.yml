@@ -3,17 +3,19 @@
 # ------------------------------------------------------------------------------
 # Solaris - downgrade package
 #
-# Neither SVR4 nor the native IPS install downgrades a package in place, so remove the
-# currently installed package(s) then install the target version. install.yml
-# first preflights eligibility AND required media before invoking remove.yml.
-# It owns any staged archive through publisher restoration and cleanup.
-# remove.yml cleans whichever database holds the package (IPS or SVR4). install.yml
-# then installs the target; its SVR4 -> IPS migration step probes the live SVR4
-# state, so it is a safe no-op here even though remove.yml has already cleared
-# any SVR4 registration - this avoids a double pkgrm when a legacy SVR4 package
-# on Solaris 11 is downgraded to older IPS media.
+#   * Solaris 11+ : IPS can install an older, version-qualified FMRI in place.
+#                   Do not uninstall first: let IPS resolve the version and its
+#                   dependencies in one transaction, preserving the installed
+#                   package if the install cannot proceed. A genuine legacy
+#                   SVR4 package is removed exactly once by install_package.yml's
+#                   live-probe migration, after install.yml preflights media.
+#   * Solaris 10  : retain the SVR4 remove-then-install transition, with required
+#                   media checked before remove.yml runs.
+#
+# install.yml owns preflight and any stage through publisher restoration/cleanup.
 # ------------------------------------------------------------------------------
 
 - include_tasks: "install.yml"
   vars:
-    sas_solaris_remove_before_install: true
+    sas_solaris_remove_before_install: >-
+      {{ ansible_facts['distribution_major_version'] is version('11', '<') }}

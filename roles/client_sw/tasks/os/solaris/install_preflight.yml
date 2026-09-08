@@ -1,8 +1,8 @@
 ---
 
 # All eligibility queries and required-media/access checks belong here, before
-# either migration pkgrm or downgrade remove.yml. No package/publisher mutation
-# is permitted in this helper.
+# native IPS install, migration pkgrm or Solaris 10 remove.yml. No
+# package/publisher mutation is permitted in this helper.
 
 # Only a CHILD relationship prohibits 'pkg install -g'. Parent/self rows do not.
 - name: check for linked IPS child images
