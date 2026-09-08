@@ -7,20 +7,11 @@
 #                   migrates a legacy SVR4 install to IPS), so reuse install.yml.
 #                   This avoids uninstalling a package before its dependents on
 #                   the native IPS path.
-#   * Solaris 10  : SVR4 has no in-place upgrade, so remove then install.
+#   * Solaris 10  : SVR4 has no in-place upgrade, so preflight media, remove,
+#                   then install within the same operation.
 # ------------------------------------------------------------------------------
 
-- name: set Authentication Services Solaris packaging facts
-  set_fact:
-    sas_solaris_is_ips: >-
-      {{ ansible_facts['distribution_major_version']
-         is version('11', '>=') }}
-
 - include_tasks: "install.yml"
-  when: sas_solaris_is_ips | bool
-
-- include_tasks: "remove.yml"
-  when: not (sas_solaris_is_ips | bool)
-
-- include_tasks: "install.yml"
-  when: not (sas_solaris_is_ips | bool)
+  vars:
+    sas_solaris_remove_before_install: >-
+      {{ ansible_facts['distribution_major_version'] is version('11', '<') }}

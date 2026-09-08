@@ -1,483 +1,56 @@
 ---
 
-# ------------------------------------------------------------------------------
-# Solaris - install package
-#
-# Branch on the OS major version:
-#
-#   * Solaris 11+ : install natively from the IPS archive discovered by
-#                   client_sw_pkgs (sas-*.p5p). Images without linked child
-#                   zones use the ephemeral 'pkg install -g' path. Since '-g'
-#                   is prohibited when linked non-global zones exist, those
-#                   images temporarily configure the archive as the sole
-#                   OneIdentity publisher origin, install the exact package
-#                   version, then restore the previous publisher state.
-#                   If the package is currently registered in the SVR4 database
-#                   (a host installed by an older release of this collection),
-#                   the legacy .pkg is removed first so the stale SVR4
-#                   registration and SMF state are cleaned up before the IPS
-#                   package is installed. The native install also upgrades an
-#                   already-IPS package in place, so the upgrade path reuses
-#                   this file.
-#
-#   * Solaris 10  : install the SVR4 package with an interactive pkgadd
-#                   (answering 'y', no '-n') so the SVR4 request script runs and
-#                   the postinstall registers the service. The 'svr4pkg' module
-#                   runs 'pkgadd -n', which skips the request script that sets
-#                   $SERVICES/$CLASSES, leaving the service unregistered.
-# ------------------------------------------------------------------------------
-
-- name: set Authentication Services Solaris packaging facts
+# One operation owns preflight, optional downgrade/SVR4-upgrade removal, native
+# install and archive cleanup. In particular, downgrade must not call remove.yml
+# before checking the linked-image publisher and the REQUIRED install media.
+# Absent-only operations still call remove.yml directly, without media checks.
+- name: reset Solaris install operation state
   set_fact:
     sas_solaris_is_ips: >-
-      {{ ansible_facts['distribution_major_version']
-         is version('11', '>=') }}
+      {{ ansible_facts['distribution_major_version'] is version('11', '>=') }}
+    sas_solaris_has_linked_images: false
+    sas_ips_stage: {}
+    sas_ips_archive_in_use: false
+    # Facts are host-scoped; never reuse a previous package's mutation markers.
+    sas_oneidentity_publisher_line: ""
+    sas_oneidentity_origin_lines: []
+    sas_oneidentity_publisher_exists: false
+    sas_oneidentity_publisher_enabled: true
+    sas_oneidentity_has_ssl_credentials: false
+    sas_oneidentity_origins_replaced: false
+    sas_oneidentity_publisher_temporarily_enabled: false
+    sas_oneidentity_cleanup_errors: []
 
-# Copy the discovered install archive/package to the target. On Solaris 11 this
-# is the shared sas-*.p5p; on Solaris 10 it is the per-package .pkg.
-- include_tasks: package_copy.yml
-
-# On Solaris 11, decide whether a GENUINE legacy SVR4 install must be removed
-# before the IPS install. Probe the LIVE state (rather than a cached fact) so
-# this is idempotent - it is safe to run this file more than once for the same
-# package (for example the downgrade path removes the package first, then
-# installs). A package is a genuine legacy SVR4 install only when 'pkginfo'
-# finds it AND 'pkg info' does not: on Solaris 11 'pkginfo' also lists IPS
-# packages, so probing 'pkginfo' alone would pkgrm the live IPS package on an
-# ordinary reinstall/upgrade.
-- name: "check {{ package }} IPS registration"
-  command:
-    cmd: "pkg info '{{ package }}'"
-  register: sas_ips_present
-  changed_when: false
-  failed_when: false
-  check_mode: false
-  environment:
-    LC_ALL: C
-  when: sas_solaris_is_ips | bool
-
-- name: "check {{ package }} SVR4 registration"
-  command:
-    cmd: "pkginfo '{{ package }}'"
-  register: sas_svr4_present
-  changed_when: false
-  failed_when: false
-  check_mode: false
-  environment:
-    LC_ALL: C
-  when: sas_solaris_is_ips | bool
-
-# Fail closed on an inconclusive probe: only the recognised not-installed
-# message may authorise treating a database as empty. An operational error must
-# not be read as "IPS absent" and let the migration pkgrm below remove a live
-# IPS package.
-- name: "verify {{ package }} IPS probe is conclusive"
-  fail:
-    msg: >-
-      Could not determine the IPS registration of {{ package }}: 'pkg info'
-      exited {{ sas_ips_present.rc }} with unexpected output -
-      {{ (sas_ips_present.stderr | default('') | trim)
-         or (sas_ips_present.stdout | default('') | trim) }}
-  when:
-    - sas_solaris_is_ips | bool
-    - (sas_ips_present.rc | default(1)) != 0
-    - not (sas_ips_present.stderr | default('') is search('no packages matching'))
-
-- name: "verify {{ package }} SVR4 probe is conclusive"
-  fail:
-    msg: >-
-      Could not determine the SVR4 registration of {{ package }}: 'pkginfo'
-      exited {{ sas_svr4_present.rc }} with unexpected output -
-      {{ (sas_svr4_present.stderr | default('') | trim)
-         or (sas_svr4_present.stdout | default('') | trim) }}
-  when:
-    - sas_solaris_is_ips | bool
-    - (sas_svr4_present.rc | default(1)) != 0
-    - not (sas_svr4_present.stderr | default('') is search('was not found'))
-
-- name: "flag {{ package }} as a genuine legacy SVR4 install"
-  set_fact:
-    sas_migrate_svr4: >-
-      {{ (sas_svr4_present.rc | default(1)) == 0
-         and (sas_ips_present.rc | default(1)) != 0 }}
-  when: sas_solaris_is_ips | bool
-
-# The admin file lets pkgadd/pkgrm run non-interactively while still executing
-# the SVR4 request script (unlike 'pkgadd -n'/'pkgrm -n'). It is needed for the
-# Solaris 10 pkgadd and for the Solaris 11 SVR4 -> IPS migration pkgrm.
-- name: create SVR4 admin file
-  copy:
-    dest: "{{ package_dest_dir }}vas.admin"
-    mode: "0644"
-    content: |
-      mail=
-      instance=overwrite
-      partial=nocheck
-      runlevel=nocheck
-      idepend=nocheck
-      rdepend=nocheck
-      space=nocheck
-      setuid=nocheck
-      conflict=nocheck
-      action=nocheck
-      basedir=default
-  changed_when: false
-  when: >-
-    not (sas_solaris_is_ips | bool)
-    or (sas_migrate_svr4 | default(false) | bool)
-
-# ------------------------------------------------------------------------------
-# Solaris 11+ : native IPS install (with legacy SVR4 -> IPS migration)
-# ------------------------------------------------------------------------------
-- name: "migrate legacy SVR4 {{ package }} to IPS"
-  shell:
-    cmd: "yes | pkgrm -a '{{ package_dest_dir }}vas.admin' '{{ package }}'"
-  register: sas_svr4_migrate
-  # pkgrm(1M) documents 2 (warning) and 10/20 (reboot required) as completed
-  # outcomes in addition to 0; accept them (as community.general.svr4pkg does)
-  # so a completed removal is not sent to 'rescue'.
-  changed_when: sas_svr4_migrate.rc in [0, 2, 10, 20]
-  failed_when: sas_svr4_migrate.rc not in [0, 2, 10, 20]
-  when:
-    - sas_solaris_is_ips | bool
-    - sas_migrate_svr4 | default(false) | bool
-
-- name: "note {{ package }} SVR4 removal reboot/warning status"
-  debug:
-    msg: >-
-      pkgrm for {{ package }} completed with return code
-      {{ sas_svr4_migrate.rc }}
-      ({{ 'reboot required' if sas_svr4_migrate.rc in [10, 20] else 'warning' }}).
-  when:
-    - sas_solaris_is_ips | bool
-    - sas_migrate_svr4 | default(false) | bool
-    - sas_svr4_migrate.rc | default(0) in [2, 10, 20]
-
-# A per-operation '-g <archive>' origin is prohibited when the image has linked
-# children (non-global zones). Use it for ordinary images and reserve the more
-# invasive publisher transaction below for images that actually need it.
-- name: check for linked IPS child images
-  command:
-    cmd: "pkg list-linked -H"
-  register: sas_ips_linked_images
-  changed_when: false
-  check_mode: false
-  environment:
-    LC_ALL: C
-  when: sas_solaris_is_ips | bool
-
-- name: record linked IPS child image state
-  set_fact:
-    sas_solaris_has_linked_images: >-
-      {{ (sas_ips_linked_images.stdout | default('')
-          | regex_findall('(?m)^\S+\s+child\s+\S+')
-          | length) > 0 }}
-  when: sas_solaris_is_ips | bool
-
-- name: "install {{ package }} directly from IPS archive"
-  command:
-    cmd: "pkg install --accept -g '{{ package_dest }}' '{{ package }}'"
-  register: pkg_install
-  changed_when: pkg_install.rc == 0
-  # pkg rc 4 == "nothing to do" (already at the requested version)
-  failed_when:
-    - pkg_install.rc != 0
-    - pkg_install.rc != 4
-  when:
-    - sas_solaris_is_ips | bool
-    - not (sas_solaris_has_linked_images | bool)
-
-# Linked child images require the archive to be an ordinary publisher origin.
-# Snapshot the existing OneIdentity configuration, replace its origins for the
-# duration of the exact-version install, and attempt every restoration step in
-# an always block. Existing SSL-authenticated origins fail closed before any
-# mutation because removing an origin deletes IPS's private key/certificate
-# copies and the CLI has no lossless publisher export facility.
-- name: "install {{ package }} from IPS publisher for linked images"
+- name: "prepare and install {{ package }} on Solaris"
   block:
 
-    # These are host-scoped facts and install.yml is included once per package.
-    # Reset every per-operation value before any command can fail so the always
-    # cleanup cannot act on values left by a previous package iteration.
-    - name: reset temporary OneIdentity publisher operation state
-      set_fact:
-        sas_oneidentity_publisher_line: ""
-        sas_oneidentity_origin_lines: []
-        sas_oneidentity_publisher_exists: false
-        sas_oneidentity_publisher_enabled: true
-        sas_oneidentity_has_ssl_credentials: false
-        sas_oneidentity_origins_replaced: false
-        sas_oneidentity_publisher_temporarily_enabled: false
-        sas_oneidentity_cleanup_errors: []
+    - include_tasks: install_preflight.yml
 
-    - name: get current IPS publisher configuration
-      command:
-        cmd: "pkg publisher -H -F tsv"
-      register: sas_ips_publishers
-      changed_when: false
-      check_mode: false
-      environment:
-        LC_ALL: C
+    - include_tasks: remove.yml
+      when: sas_solaris_remove_before_install | default(false) | bool
 
-    - name: record existing OneIdentity publisher line
-      set_fact:
-        sas_oneidentity_publisher_line: >-
-          {{ (sas_ips_publishers.stdout_lines | default([])
-              | select('match', '^OneIdentity\t')
-              | list | first | default('', true)) }}
-
-    # The TSV ENABLED column is unreliable for disabled publishers that still
-    # have origins on Solaris 11.4 (it remains "true"). The detail view's
-    # "Publisher enabled: Yes/No" value is authoritative.
-    - name: get current OneIdentity publisher properties
-      command:
-        cmd: "pkg publisher OneIdentity"
-      register: sas_oneidentity_publisher_details
-      changed_when: false
-      failed_when: false
-      check_mode: false
-      environment:
-        LC_ALL: C
-      when: (sas_oneidentity_publisher_line | length) > 0
-
-    # 'pkg publisher' can return 3 for a certificate-expiry warning while still
-    # emitting the complete configuration. Accept that usable output, but fail
-    # closed if the expected identity/enabled fields are missing.
-    - name: verify OneIdentity publisher properties are conclusive
-      fail:
-        msg: >-
-          Could not read the complete OneIdentity publisher configuration:
-          {{ (sas_oneidentity_publisher_details.stderr | default('') | trim)
-             or ('pkg publisher exited '
-                 ~ (sas_oneidentity_publisher_details.rc | string)) }}
-      when:
-        - (sas_oneidentity_publisher_line | length) > 0
-        - >-
-          not (sas_oneidentity_publisher_details.stdout | default('')
-               is search('Publisher:\s+OneIdentity'))
-          or not (sas_oneidentity_publisher_details.stdout | default('')
-                  is search('(?:Publisher enabled|Enabled):\s+(?:Yes|No)'))
-
-    - name: record existing OneIdentity publisher state
-      set_fact:
-        sas_oneidentity_origin_lines: >-
-          {{ sas_ips_publishers.stdout_lines | default([])
-             | select('match', '^OneIdentity\t.*\torigin\t')
-             | list }}
-        sas_oneidentity_publisher_exists: >-
-          {{ (sas_oneidentity_publisher_line | length) > 0 }}
-        sas_oneidentity_publisher_enabled: >-
-          {{ sas_oneidentity_publisher_details.stdout | default('')
-             is search('(?:Publisher enabled|Enabled):\s+Yes') }}
-        sas_oneidentity_has_ssl_credentials: >-
-          {{ sas_oneidentity_publisher_details.stdout | default('')
-             is search('SSL (?:Key|Cert):\s+(?!None(?:\s|$))\S+') }}
-
-    - name: reject unsafe replacement of SSL-authenticated publisher origins
-      fail:
-        msg: >-
-          Cannot install {{ package }} for linked IPS images because the
-          existing OneIdentity publisher uses SSL client credentials. Solaris
-          deletes its private credential copies when origins are removed, so
-          the publisher cannot be restored losslessly. Remove or separately
-          preserve that publisher configuration before running this role.
-      when:
-        - sas_oneidentity_publisher_exists | bool
-        - sas_oneidentity_has_ssl_credentials | bool
-
-    # Origins under one IPS publisher are replicas, not ordered alternatives.
-    # Replace every existing origin so IPS can only fetch the requested build
-    # from package_dest; restore the full original list in the always block.
-    - name: temporarily replace OneIdentity publisher origins
-      command:
-        cmd: >-
-          pkg set-publisher
-          {{ "-G '*' " if sas_oneidentity_publisher_exists | bool else "" }}
-          -g '{{ package_dest }}' OneIdentity
-      register: sas_oneidentity_origins_replace
-      changed_when: false
-
-    - name: record replaced OneIdentity publisher origins
-      set_fact:
-        sas_oneidentity_origins_replaced: true
-      when:
-        - sas_oneidentity_origins_replace is defined
-        - not (sas_oneidentity_origins_replace.skipped | default(false))
-        - (sas_oneidentity_origins_replace.rc | default(1)) == 0
-
-    # Replace origins before enabling a disabled publisher. A publisher is often
-    # disabled because its old origin is unreachable; enabling first could
-    # refresh that bad origin and fail before the supplied archive is configured.
-    - name: temporarily enable the OneIdentity publisher
-      command:
-        cmd: "pkg set-publisher --enable OneIdentity"
-      register: sas_oneidentity_publisher_enable
-      changed_when: false
-      when:
-        - sas_oneidentity_publisher_exists | bool
-        - not (sas_oneidentity_publisher_enabled | bool)
-
-    - name: record temporarily enabled OneIdentity publisher
-      set_fact:
-        sas_oneidentity_publisher_temporarily_enabled: true
-      when:
-        - sas_oneidentity_publisher_enable is defined
-        - not (sas_oneidentity_publisher_enable.skipped | default(false))
-        - (sas_oneidentity_publisher_enable.rc | default(1)) == 0
-
-    - name: "install {{ package }} from configured IPS publisher"
-      command:
-        cmd: >-
-          pkg install --accept
-          'pkg://OneIdentity/{{ package }}@{{ client_sw_pkgs['packages'][package]['vers'] }}'
-      register: pkg_install
-      changed_when: pkg_install.rc == 0
-      # pkg rc 4 == "nothing to do" (already at the requested version)
-      failed_when:
-        - pkg_install.rc != 0
-        - pkg_install.rc != 4
+    # Keep the live pkg info/pkginfo probes in this helper AFTER an optional
+    # removal: cached version facts still describe the old SVR4 install during
+    # downgrade and must not cause a second pkgrm.
+    - include_tasks: install_package.yml
 
   always:
 
-    # Restore an originally disabled publisher before adding its old origins.
-    # This prevents IPS from refreshing intentionally unreachable origins.
-    - name: restore the disabled OneIdentity publisher
-      command:
-        cmd: "pkg set-publisher --disable OneIdentity"
-      register: sas_oneidentity_publisher_disable
-      changed_when: false
-      failed_when: false
-      when:
-        - sas_oneidentity_publisher_exists | default(false) | bool
-        - sas_oneidentity_publisher_temporarily_enabled | default(false) | bool
-
-    - name: record OneIdentity publisher disable failure
-      set_fact:
-        sas_oneidentity_cleanup_errors: >-
-          {{ sas_oneidentity_cleanup_errors
-             + ['could not restore disabled OneIdentity publisher'
-                ~ ' (rc=' ~ (sas_oneidentity_publisher_disable.rc | string) ~ ')'] }}
-      when:
-        - sas_oneidentity_publisher_disable is defined
-        - not (sas_oneidentity_publisher_disable.skipped | default(false))
-        - (sas_oneidentity_publisher_disable.rc | default(0)) != 0
-
-    - name: remove the temporary OneIdentity publisher origins
-      command:
-        cmd: "pkg set-publisher --no-refresh -G '*' OneIdentity"
-      register: sas_oneidentity_origins_remove
-      changed_when: false
-      failed_when: false
-      when:
-        - sas_oneidentity_publisher_exists | default(false) | bool
-        - sas_oneidentity_origins_replaced | default(false) | bool
-
-    - name: record temporary OneIdentity origins cleanup failure
-      set_fact:
-        sas_oneidentity_cleanup_errors: >-
-          {{ sas_oneidentity_cleanup_errors
-             + ['could not remove temporary OneIdentity origins'
-                ~ ' (rc=' ~ (sas_oneidentity_origins_remove.rc | string) ~ ')'] }}
-      when:
-        - sas_oneidentity_origins_remove is defined
-        - not (sas_oneidentity_origins_remove.skipped | default(false))
-        - (sas_oneidentity_origins_remove.rc | default(0)) != 0
-
-    - name: restore OneIdentity publisher origins
-      command:
-        cmd: >-
-          pkg set-publisher --no-refresh
-          {{ "--disable"
-             if sas_oneidentity_origin_fields[3] == 'false'
-             else "" }}
-          -g '{{ sas_oneidentity_origin_fields[6] }}'
-          {{ "--proxy '" ~ sas_oneidentity_origin_fields[7] ~ "'"
-             if (sas_oneidentity_origin_fields | length) > 7
-                and sas_oneidentity_origin_fields[7] not in ['', '-']
-             else "" }}
-          OneIdentity
-      loop: "{{ sas_oneidentity_origin_lines | default([]) }}"
-      loop_control:
-        loop_var: sas_oneidentity_origin_line
-      register: sas_oneidentity_origins_restore
-      changed_when: false
-      failed_when: false
-      when:
-        - sas_oneidentity_publisher_exists | default(false) | bool
-        - sas_oneidentity_origins_replaced | default(false) | bool
-      vars:
-        sas_oneidentity_origin_fields: "{{ sas_oneidentity_origin_line.split('\t') }}"
-
-    - name: record OneIdentity publisher origin restore failures
-      set_fact:
-        sas_oneidentity_cleanup_errors: >-
-          {{ sas_oneidentity_cleanup_errors
-             + ['could not restore OneIdentity origin '
-                ~ sas_oneidentity_origin_result.sas_oneidentity_origin_line.split('\t')[6]
-                ~ ' (rc=' ~ (sas_oneidentity_origin_result.rc | string) ~ ')'] }}
-      loop: "{{ sas_oneidentity_origins_restore.results | default([]) }}"
-      loop_control:
-        loop_var: sas_oneidentity_origin_result
-      when:
-        - not (sas_oneidentity_origin_result.skipped | default(false))
-        - (sas_oneidentity_origin_result.rc | default(0)) != 0
-
-    - name: remove the temporary OneIdentity publisher
-      command:
-        cmd: "pkg unset-publisher OneIdentity"
-      register: sas_oneidentity_publisher_unset
-      changed_when: false
-      failed_when: false
-      when:
-        - not (sas_oneidentity_publisher_exists | default(true) | bool)
-        - sas_oneidentity_origins_replaced | default(false) | bool
-
-    - name: record temporary OneIdentity publisher cleanup failure
-      set_fact:
-        sas_oneidentity_cleanup_errors: >-
-          {{ sas_oneidentity_cleanup_errors
-             + ['could not remove temporary OneIdentity publisher'
-                ~ ' (rc=' ~ (sas_oneidentity_publisher_unset.rc | string) ~ ')'] }}
-      when:
-        - sas_oneidentity_publisher_unset is defined
-        - not (sas_oneidentity_publisher_unset.skipped | default(false))
-        - (sas_oneidentity_publisher_unset.rc | default(0)) != 0
-
-    - name: fail if temporary OneIdentity publisher cleanup was incomplete
-      fail:
+    - name: report staged IPS archive retained for an unrestored publisher
+      debug:
         msg: >-
-          Failed to restore the OneIdentity IPS publisher configuration:
-          {{ sas_oneidentity_cleanup_errors | join('; ') }}
-      when: (sas_oneidentity_cleanup_errors | default([]) | length) > 0
+          Retaining {{ sas_ips_stage.path }} because the temporary OneIdentity
+          origin may still use its archive. Restore the publisher configuration
+          before removing this directory.
+      when:
+        - sas_ips_stage.path is defined
+        - sas_ips_archive_in_use | bool
 
-  when:
-    - sas_solaris_is_ips | bool
-    - sas_solaris_has_linked_images | bool
-
-# ------------------------------------------------------------------------------
-# Solaris 10 : SVR4 install via interactive pkgadd
-# ------------------------------------------------------------------------------
-# NOTE: Do NOT use the 'svr4pkg' module here - it runs 'pkgadd -n' and the SVR4
-# request script (which sets $SERVICES/$CLASSES) is skipped, leaving vasd's SMF
-# service unregistered. 'yes |' answers the request script prompts.
-- name: "install {{ package }}"
-  shell:
-    cmd: >-
-      yes | pkgadd -a '{{ package_dest_dir }}vas.admin'
-      -G -d '{{ package_dest }}' '{{ package }}'
-  register: pkg_install
-  # pkgadd(1M) documents 2 (warning) and 10/20 (reboot required) as completed
-  # outcomes in addition to 0; accept them (as community.general.svr4pkg does)
-  # so a completed install is not reported as a failure.
-  changed_when: pkg_install.rc in [0, 2, 10, 20]
-  failed_when: pkg_install.rc not in [0, 2, 10, 20]
-  when: not (sas_solaris_is_ips | bool)
-
-- name: "note {{ package }} pkgadd reboot/warning status"
-  debug:
-    msg: >-
-      pkgadd for {{ package }} completed with return code {{ pkg_install.rc }}
-      ({{ 'reboot required' if pkg_install.rc in [10, 20] else 'warning' }}).
-  when:
-    - not (sas_solaris_is_ips | bool)
-    - pkg_install.rc | default(0) in [2, 10, 20]
+    - name: remove this operation's unused IPS archive directory
+      file:
+        path: "{{ sas_ips_stage.path }}"
+        state: absent
+      changed_when: false
+      when:
+        - sas_ips_stage.path is defined
+        - not (sas_ips_archive_in_use | bool)

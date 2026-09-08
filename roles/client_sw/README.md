@@ -121,6 +121,36 @@ Report generation variable defaults for all roles are set by variables in the [`
 
   The `dest` key for each list entry is the report file on the machine specified in `client_sw_reports_host`.  If `client_sw_reports_host` is set to the Ansible control node a relative path can be used and it will be relative to the directory from which the playbook is run.  For other hosts, an absolute path must be used.  In either case the containing directory must exist.
 
+## Solaris install preflight and linked-image media
+
+Solaris install, upgrade and downgrade operations check required media before
+removing the installed package. On Solaris 11, linked-child discovery and any
+required OneIdentity publisher checks also finish before either SVR4 `pkgrm` or
+IPS uninstall. Query failures, SSL client credentials and inherited/system
+publishers (`SYSPUB=true`) reject the linked-image operation without removing the
+working package or changing its publisher. Absent-only removal does not require
+install media or these install-only checks.
+
+Images with actual linked **children** use a temporary publisher origin. For
+each package operation, the required archive is copied to a unique root-owned
+`/var/tmp/ansible-as-ips-*` directory (0755), with a regular archive file (0644).
+A subprocess drops privileges to the Solaris system-repository worker `pkg5srv`
+and reads the archive before any removal, checking access through all ancestors.
+Caller-owned `client_sw_tmp_dir` parents and pre-existing media are not chmodded.
+The archive contains installation media, not credentials, and is intentionally
+readable by local users during the operation.
+
+The existing publisher's enabled state, origins, origin enable states and proxies
+are restored after the install attempt. Only the operation's own staging directory
+is cleaned, after the temporary origin is detached. If publisher cleanup fails
+and the archive may still be in use, the role reports and retains that directory;
+restore the publisher before removing the reported path. Images without linked
+children retain `pkg install -g`; Solaris 10 retains interactive SVR4 installation.
+
+Check mode performs read-only discovery/publisher checks and checks the controller
+media source, but creates no staging directory and mutates no package or publisher.
+Worker access to a newly staged archive can only be verified during a real run.
+
 ## Plugins
 
 The `client_sw` role contains a few plugins to support operation of the role:

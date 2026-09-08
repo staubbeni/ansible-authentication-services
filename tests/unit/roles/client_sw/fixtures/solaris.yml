@@ -1,0 +1,35 @@
+---
+
+# Only the production version/routing tasks are included, never gather_facts or
+# the role's main entry point. The test runner replaces all command/filesystem
+# actions with sandboxed stubs; this playbook MUST be run by the unittest.
+- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_facts:
+      os_family: Solaris
+      distribution_major_version: "{{ solaris_test_major }}"
+      python:
+        executable: "{{ solaris_test_python }}"
+    client_sw_tmp_dir: "{{ solaris_test_root }}/private"
+    client_sw_facts_generate: false
+    client_sw_reports_generate: false
+  tasks:
+    - name: read installed state with production version probes
+      include_role:
+        name: client_sw
+        tasks_from: read_package_version.yml
+      vars:
+        package: "{{ item.key }}"
+        state: "{{ item.value }}"
+        flag: beg
+      loop: "{{ solaris_test_packages }}"
+
+    - name: execute production install upgrade downgrade migration or removal
+      include_role:
+        name: client_sw
+        tasks_from: run_package_task.yml
+      vars:
+        package: "{{ item.key }}"
+        state: "{{ item.value }}"
+      loop: "{{ solaris_test_packages }}"

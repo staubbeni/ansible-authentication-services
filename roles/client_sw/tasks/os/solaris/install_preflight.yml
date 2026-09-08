@@ -1,0 +1,199 @@
+---
+
+# All eligibility queries and required-media/access checks belong here, before
+# either migration pkgrm or downgrade remove.yml. No package/publisher mutation
+# is permitted in this helper.
+
+# Only a CHILD relationship prohibits 'pkg install -g'. Parent/self rows do not.
+- name: check for linked IPS child images
+  command:
+    cmd: "pkg list-linked -H"
+  register: sas_ips_linked_images
+  changed_when: false
+  check_mode: false
+  environment:
+    LC_ALL: C
+  when: sas_solaris_is_ips | bool
+
+- name: record linked IPS child image state
+  set_fact:
+    sas_solaris_has_linked_images: >-
+      {{ (sas_ips_linked_images.stdout | default('')
+          | regex_findall('(?m)^\S+\s+child\s+\S+')
+          | length) > 0 }}
+  when: sas_solaris_is_ips | bool
+
+- name: preflight OneIdentity publisher for linked IPS children
+  block:
+
+    - name: get current IPS publisher configuration
+      command:
+        cmd: "pkg publisher -H -F tsv"
+      register: sas_ips_publishers
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+
+    # PUBLISHER STICKY SYSPUB ENABLED TYPE STATUS URI [PROXY].
+    # ENABLED is per-origin, NOT the system/read-only publisher flag.
+    - name: verify OneIdentity publisher rows are conclusive
+      fail:
+        msg: Could not read the complete OneIdentity publisher TSV configuration.
+      loop: >-
+        {{ sas_ips_publishers.stdout_lines | default([])
+           | select('match', '^OneIdentity(?:\t|$)') | list }}
+      loop_control:
+        loop_var: sas_oneidentity_preflight_line
+      vars:
+        sas_oneidentity_preflight_fields: "{{ sas_oneidentity_preflight_line.split('\t') }}"
+      when: >-
+        (sas_oneidentity_preflight_fields | length) < 7
+        or sas_oneidentity_preflight_fields[2] not in ['true', 'false']
+        or sas_oneidentity_preflight_fields[3] not in ['true', 'false']
+
+    - name: reject replacement of system-managed OneIdentity publisher origins
+      fail:
+        msg: >-
+          Cannot install {{ package }} for linked IPS images because OneIdentity
+          is an inherited/system publisher (SYSPUB=true). Its read-only
+          configuration cannot be temporarily replaced and restored by this role.
+      when: >-
+        (sas_ips_publishers.stdout_lines | default([])
+         | select('match', '^OneIdentity\t[^\t]*\ttrue\t') | list | length) > 0
+
+    - name: record existing OneIdentity publisher line
+      set_fact:
+        sas_oneidentity_publisher_line: >-
+          {{ (sas_ips_publishers.stdout_lines | default([])
+              | select('match', '^OneIdentity\t')
+              | list | first | default('', true)) }}
+
+    # On Solaris 11.4 TSV ENABLED can still be true for a disabled publisher.
+    # The detail view is authoritative for the publisher-wide enabled state.
+    - name: get current OneIdentity publisher properties
+      command:
+        cmd: "pkg publisher OneIdentity"
+      register: sas_oneidentity_publisher_details
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+      when: (sas_oneidentity_publisher_line | length) > 0
+
+    # Complete output accompanied by rc 3 (certificate warning) is usable.
+    # Other errors or missing identity/enabled fields must fail before removal.
+    - name: verify OneIdentity publisher properties are conclusive
+      fail:
+        msg: >-
+          Could not read the complete OneIdentity publisher configuration:
+          {{ (sas_oneidentity_publisher_details.stderr | default('') | trim)
+             or ('pkg publisher exited '
+                 ~ (sas_oneidentity_publisher_details.rc | string)) }}
+      when:
+        - (sas_oneidentity_publisher_line | length) > 0
+        - >-
+          (sas_oneidentity_publisher_details.rc | default(1)) not in [0, 3]
+          or not (sas_oneidentity_publisher_details.stdout | default('')
+                  is search('Publisher:\s+OneIdentity'))
+          or not (sas_oneidentity_publisher_details.stdout | default('')
+                  is search('(?:Publisher enabled|Enabled):\s+(?:Yes|No)'))
+
+    - name: record existing OneIdentity publisher state
+      set_fact:
+        sas_oneidentity_origin_lines: >-
+          {{ sas_ips_publishers.stdout_lines | default([])
+             | select('match', '^OneIdentity\t.*\torigin\t') | list }}
+        sas_oneidentity_publisher_exists: >-
+          {{ (sas_oneidentity_publisher_line | length) > 0 }}
+        sas_oneidentity_publisher_enabled: >-
+          {{ sas_oneidentity_publisher_details.stdout | default('')
+             is search('(?:Publisher enabled|Enabled):\s+Yes') }}
+        sas_oneidentity_has_ssl_credentials: >-
+          {{ sas_oneidentity_publisher_details.stdout | default('')
+             is search('SSL (?:Key|Cert):\s+(?!None(?:\s|$))\S+') }}
+
+    - name: reject unsafe replacement of SSL-authenticated publisher origins
+      fail:
+        msg: >-
+          Cannot install {{ package }} for linked IPS images because the
+          existing OneIdentity publisher uses SSL client credentials. Solaris
+          deletes its private credential copies when origins are removed, so
+          the publisher cannot be restored losslessly. Remove or separately
+          preserve that publisher configuration before running this role.
+      when:
+        - sas_oneidentity_publisher_exists | bool
+        - sas_oneidentity_has_ssl_credentials | bool
+
+  when:
+    - sas_solaris_is_ips | bool
+    - sas_solaris_has_linked_images | bool
+
+# Keep the existing media location for Solaris 10 and unlinked Solaris 11.
+# In check mode copy validates the controller source without creating a stage
+# (tempfile has no check-mode path); pkg5srv access is deferred to a real run.
+- include_tasks: package_copy.yml
+  when: >-
+    not (sas_solaris_is_ips | bool)
+    or not (sas_solaris_has_linked_images | bool)
+    or ansible_check_mode
+
+- name: stage and verify linked IPS archive before package removal
+  block:
+
+    # Do not use/chmod client_sw_tmp_dir's caller-owned ancestors. mkdtemp
+    # creates a unique owned directory; 0755 permits search without write access.
+    - name: allocate this operation's linked IPS archive directory
+      tempfile:
+        state: directory
+        path: /var/tmp
+        prefix: ansible-as-ips-
+      register: sas_ips_stage
+      changed_when: false
+
+    - name: make owned IPS archive directory searchable by pkg5srv
+      file:
+        path: "{{ sas_ips_stage.path }}"
+        state: directory
+        owner: root
+        mode: "0755"
+      changed_when: false
+
+    - name: copy required IPS archive with deliberate worker-readable access
+      copy:
+        src: "{{ package_src }}"
+        dest: "{{ sas_ips_stage.path }}/archive.p5p"
+        owner: root
+        mode: "0644"
+      changed_when: false
+
+    # pkg5srv need not have a login shell or sudo access. Drop the subprocess's
+    # privileges before checking the entire path and reading the regular file;
+    # root's access (or file mode alone) cannot establish worker readability.
+    # Use only Python 2.6-compatible stdlib operations for historical targets.
+    - name: verify staged IPS archive access as the pkg5srv worker
+      command:
+        argv:
+          - "{{ ansible_facts['python']['executable'] }}"
+          - "-c"
+          - |
+            import os
+            import pwd
+            import stat
+            import sys
+            worker = pwd.getpwnam("pkg5srv")
+            os.setgroups([])
+            os.setgid(worker.pw_gid)
+            os.setuid(worker.pw_uid)
+            if not stat.S_ISREG(os.lstat(sys.argv[1]).st_mode):
+                sys.exit("The staged IPS archive is not a regular file")
+            with open(sys.argv[1], "rb") as archive:
+                archive.read(1)
+          - "{{ sas_ips_stage.path }}/archive.p5p"
+      changed_when: false
+
+  when:
+    - sas_solaris_is_ips | bool
+    - sas_solaris_has_linked_images | bool
+    - not ansible_check_mode
